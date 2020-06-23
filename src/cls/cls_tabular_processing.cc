@@ -84,6 +84,7 @@ int processSkyFb(
     // 1. check the preds for passing
     // 2a. accumulate agg preds (return flexbuf built after all rows) or
     // 2b. build the return flatbuf inline below from each row's projection
+    std::vector<sky_rec> non_agg_passed_rows;
     for (uint32_t i = 0; i < nrows; i++) {
 
         // process row i or the specified row number
@@ -104,117 +105,18 @@ int processSkyFb(
 
         // apply predicates to this record
         if (!preds.empty()) {
-            bool pass = applyPredicates(preds, rec);
+            if(non_agg_preds.empty()) {
+                non_agg_passed_rows.push_back(rec);
+            }
+            bool pass = applyPredicates(non_agg_preds, rec);
             if (!pass) continue;  // skip non matching rows.
         }
-
-        // note: agg preds are accumlated in the predicate itself during
-        // applyPredicates above, then later added to result fb outside
-        // of this loop (i.e., they are not encoded into the result fb yet)
-        // thus we can skip the below encoding of rows into the result fb
-        // and just continue accumulating agg preds in this processing loop.
-        if (!encode_rows) continue;
+        non_agg_passed_rows.push_back(rec);
 
         if (project_all) {
             // TODO:  just pass through row table offset to new data_vec
             // (which is also type offs), do not rebuild row table and flexbuf
         }
-
-        // build the return projection for this row.
-        auto row = rec.data.AsVector();
-        flexbuffers::Builder *flexbldr = new flexbuffers::Builder();
-        flatbuffers::Offset<flatbuffers::Vector<unsigned char>> datavec;
-
-        flexbldr->Vector([&]() {
-
-            // iter over the query schema, locating it within the data schema
-            for (auto it=query_schema.begin();
-                      it!=query_schema.end() && !errcode; ++it) {
-                col_info col = *it;
-                if (col.idx < AGG_COL_LAST or col.idx > col_idx_max) {
-                    errcode = TablesErrCodes::RequestedColIndexOOB;
-                    errmsg.append("ERROR processSkyFb(): table=" +
-                            root.table_name + "; rid=" +
-                            std::to_string(rec.RID) + " col.idx=" +
-                            std::to_string(col.idx) + " OOB.");
-
-                } else {
-
-                    switch(col.type) {  // encode data val into flexbuf
-
-                        case SDT_INT8:
-                            flexbldr->Add(row[col.idx].AsInt8());
-                            break;
-                        case SDT_INT16:
-                            flexbldr->Add(row[col.idx].AsInt16());
-                            break;
-                        case SDT_INT32:
-                            flexbldr->Add(row[col.idx].AsInt32());
-                            break;
-                        case SDT_INT64:
-                            flexbldr->Add(row[col.idx].AsInt64());
-                            break;
-                        case SDT_UINT8:
-                            flexbldr->Add(row[col.idx].AsUInt8());
-                            break;
-                        case SDT_UINT16:
-                            flexbldr->Add(row[col.idx].AsUInt16());
-                            break;
-                        case SDT_UINT32:
-                            flexbldr->Add(row[col.idx].AsUInt32());
-                            break;
-                        case SDT_UINT64:
-                            flexbldr->Add(row[col.idx].AsUInt64());
-                            break;
-                        case SDT_CHAR:
-                            flexbldr->Add(row[col.idx].AsInt8());
-                            break;
-                        case SDT_UCHAR:
-                            flexbldr->Add(row[col.idx].AsUInt8());
-                            break;
-                        case SDT_BOOL:
-                            flexbldr->Add(row[col.idx].AsBool());
-                            break;
-                        case SDT_FLOAT:
-                            flexbldr->Add(row[col.idx].AsFloat());
-                            break;
-                        case SDT_DOUBLE:
-                            flexbldr->Add(row[col.idx].AsDouble());
-                            break;
-                        case SDT_DATE:
-                            flexbldr->Add(row[col.idx].AsString().str());
-                            break;
-                        case SDT_STRING:
-                            flexbldr->Add(row[col.idx].AsString().str());
-                            break;
-                        default: {
-                            errcode = TablesErrCodes::UnsupportedSkyDataType;
-                            errmsg.append("ERROR processSkyFb(): table=" +
-                                    root.table_name + "; rid=" +
-                                    std::to_string(rec.RID) + " col.type=" +
-                                    std::to_string(col.type) +
-                                    " UnsupportedSkyDataType.");
-                        }
-                    }
-                }
-            }
-        });
-
-        // finalize the row's projected data within our flexbuf
-        flexbldr->Finish();
-
-        // build the return ROW flatbuf that contains the flexbuf data
-        auto row_data = flatbldr.CreateVector(flexbldr->GetBuffer());
-        delete flexbldr;
-
-        // TODO: update nullbits
-        auto nullbits = flatbldr.CreateVector(rec.nullbits);
-        flatbuffers::Offset<Tables::Record> row_off = \
-                Tables::CreateRecord(flatbldr, rec.RID, nullbits, row_data);
-
-        // Continue building the ROOT flatbuf's dead vector and rowOffsets vec
-        dead_rows.push_back(0);
-        offs.push_back(row_off);
     }
 
     // here we build the return flatbuf result with agg values that were
