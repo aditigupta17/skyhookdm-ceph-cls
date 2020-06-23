@@ -22,6 +22,7 @@ namespace Tables {
  * @param[in] tbl_schema   : Schema of an input table
  * @param[in] query_schema : Schema of an query
  * @param[in] preds        : Predicates for the query
+ * @param[in] groupby_cols : GROUP BY columns in a string
  * @param[in] dataptr      : Input table in the form of char array
  * @param[in] datasz       : Size of char array
  * @param[out] errmsg      : Error message
@@ -34,6 +35,7 @@ int processSkyFb(
     schema_vec& data_schema,
     schema_vec& query_schema,
     predicate_vec& preds,
+    std::string& groupby_cols,
     const char* dataptr,
     const size_t datasz,
     std::string& errmsg,
@@ -117,6 +119,84 @@ int processSkyFb(
             // TODO:  just pass through row table offset to new data_vec
             // (which is also type offs), do not rebuild row table and flexbuf
         }
+    }
+
+    // apply groupby
+    bool groupby_arg = false;
+    if(groupby_cols != "") groupby_arg = true;
+    std::map<std::vector<string>, std::vector<sky_rec>> groupby_map;
+
+    if (groupby_arg) {
+        Tables::schema_vec groupby_schema = schemaFromColNames(data_schema, groupby_cols);
+        for (auto rec : non_agg_passed_rows) {
+            auto row = rec.data.AsVector();
+            std::vector<string> key;
+            for (auto it = groupby_schema.begin(); it != groupby_schema.end() && !errcode; ++it) {
+                col_info col = *it;
+                switch (col.type) {  // encode data val into flexbuf
+                    case SDT_INT8:
+                        key.push_back(std::to_string(row[col.idx].AsInt8()));
+                        break;
+                    case SDT_INT16:
+                        key.push_back(std::to_string(row[col.idx].AsInt16()));
+                        break;
+                    case SDT_INT32:
+                        key.push_back(std::to_string(row[col.idx].AsInt32()));
+                        break;
+                    case SDT_INT64:
+                        key.push_back(std::to_string(row[col.idx].AsInt64()));
+                        break;
+                    case SDT_UINT8:
+                        key.push_back(std::to_string(row[col.idx].AsUInt8()));
+                        break;
+                    case SDT_UINT16:
+                        key.push_back(std::to_string(row[col.idx].AsUInt16()));
+                        break;
+                    case SDT_UINT32:
+                        key.push_back(std::to_string(row[col.idx].AsUInt32()));
+                        break;
+                    case SDT_UINT64:
+                        key.push_back(std::to_string(row[col.idx].AsUInt64()));
+                        break;
+                    case SDT_CHAR:
+                        key.push_back(std::to_string(row[col.idx].AsInt8()));
+                        break;
+                    case SDT_UCHAR:
+                        key.push_back(std::to_string(row[col.idx].AsUInt8()));
+                        break;
+                    case SDT_BOOL: {
+                        bool val = row[col.idx].AsBool();
+                        if (val) {
+                            key.push_back("true");
+                        } else {
+                            key.push_back("false");
+                        }
+                        break;
+                    }
+                    case SDT_FLOAT:
+                        key.push_back(std::to_string(row[col.idx].AsFloat()));
+                        break;
+                    case SDT_DOUBLE:
+                        key.push_back(std::to_string(row[col.idx].AsDouble()));
+                        break;
+                    case SDT_DATE:
+                        key.push_back(row[col.idx].AsString().str());
+                        break;
+                    case SDT_STRING:
+                        key.push_back(row[col.idx].AsString().str());
+                        break;
+                    default: {
+                        errcode = TablesErrCodes::UnsupportedSkyDataType;
+                        errmsg.append("ERROR processSkyFb(): table=" +
+                                root.table_name + "; rid=" +
+                                std::to_string(rec.RID) + " col.type=" +
+                                std::to_string(col.type) +
+                                " UnsupportedSkyDataType.");
+                    }
+                }
+            }
+            groupby_map[key].push_back(rec);
+        } 
     }
 
     // here we build the return flatbuf result with agg values that were

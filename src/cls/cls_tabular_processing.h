@@ -33,6 +33,7 @@ int processSkyFb(
         schema_vec& query_schema,
         predicate_vec& preds,
         const char* fb,
+        std::string& groupby_cols,
         const size_t fb_size,
         std::string& errmsg,
         const std::vector<uint32_t>& row_nums=std::vector<uint32_t>());
