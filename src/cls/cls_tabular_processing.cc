@@ -203,6 +203,33 @@ int processSkyFb(
         } 
     }
 
+    // Apply aggs
+    if (!groupby_map.empty()) {
+        if (agg_preds.empty()) {
+            for (auto p : groupby_map) {
+                std::vector<sky_rec> rows = p.second;
+                // act like DISTINCT, picks the first row
+                processed_rows.push_back(rows[0]);
+            }
+        }
+        // else {
+        //     for(auto p : groupby_map) {
+        //         std::vector<sky_rec> rows = p.second;
+        //         sky_rec rec = applyAggPreds(rows, agg_preds);
+        //         processed_rows.push_back(rec);
+        //     }
+        // }
+    } else {
+        if (agg_preds.empty()) {
+            for (auto r : non_agg_passed_rows)
+                processed_rows.push_back(r);
+        }
+        // else {
+        //     sky_rec rec = applyAggPreds(non_agg_passed_rows, agg_preds);
+        //     processed_rows.push_back(rec);
+        // }
+    }
+
     // Apply orderby
     bool orderby_arg = false;
     if(orderby_cols != "") orderby_arg = true;

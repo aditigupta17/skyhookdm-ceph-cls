@@ -1499,6 +1499,230 @@ bool applyPredicates(predicate_vec& pv, sky_rec& rec) {
     return rowpass;
 }
 
+// sky_rec applyAggPreds(std::vector<sky_rec>& rows, predicate_vec& agg_preds) {
+//     sky_rec output = rows[0];
+//     for (auto p : agg_preds) {
+//         int col = p->colIdx();
+//         switch(p->colType()) {
+
+//             // update the agg-ed columns in output in each case
+
+//             // NOTE: predicates have typed ints but our int comparison
+//             // functions are defined on 64bit ints.
+//             case SDT_BOOL: {
+//                 // initial value = val in first row
+//                 auto rec = rows[0].data.AsVector(); 
+//                 bool agg = rec[col].AsBool();
+//                 for (auto rec : rows) {
+//                     bool agg = computeAgg(rec[col].AsBool(), agg, p->opType());
+//                 }
+//                 output[col] 
+//                 break;
+//             }
+
+//             case SDT_INT8: {
+//                 TypedPredicate<int8_t>* p = \
+//                         dynamic_cast<TypedPredicate<int8_t>*>(*it);
+//                 int8_t colval = row[p->colIdx()].AsInt8();
+//                 int8_t predval = p->Val();
+//                 if (p->isGlobalAgg())
+//                     p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                 else
+//                     colpass = compare(colval,
+//                                       static_cast<int64_t>(predval),
+//                                       p->opType());
+//                 break;
+//             }
+
+//             case SDT_INT16: {
+//                 TypedPredicate<int16_t>* p = \
+//                         dynamic_cast<TypedPredicate<int16_t>*>(*it);
+//                 int16_t colval = row[p->colIdx()].AsInt16();
+//                 int16_t predval = p->Val();
+//                 if (p->isGlobalAgg())
+//                     p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                 else
+//                     colpass = compare(colval,
+//                                       static_cast<int64_t>(predval),
+//                                       p->opType());
+//                 break;
+//             }
+
+//             case SDT_INT32: {
+//                 TypedPredicate<int32_t>* p = \
+//                         dynamic_cast<TypedPredicate<int32_t>*>(*it);
+//                 int32_t colval = row[p->colIdx()].AsInt32();
+//                 int32_t predval = p->Val();
+//                 if (p->isGlobalAgg())
+//                     p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                 else
+//                     colpass = compare(colval,
+//                                       static_cast<int64_t>(predval),
+//                                       p->opType());
+//                 break;
+//             }
+
+//             case SDT_INT64: {
+//                 TypedPredicate<int64_t>* p = \
+//                         dynamic_cast<TypedPredicate<int64_t>*>(*it);
+//                 int64_t colval = 0;
+//                 if ((*it)->colIdx() == RID_COL_INDEX)
+//                     colval = rec.RID;  // RID val not in the row
+//                 else
+//                     colval = row[p->colIdx()].AsInt64();
+//                 int64_t predval = p->Val();
+//                 if (p->isGlobalAgg())
+//                     p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                 else
+//                     colpass = compare(colval,predval,p->opType());
+//                 break;
+//             }
+
+//             case SDT_UINT8: {
+//                 TypedPredicate<uint8_t>* p = \
+//                         dynamic_cast<TypedPredicate<uint8_t>*>(*it);
+//                 uint8_t colval = row[p->colIdx()].AsUInt8();
+//                 uint8_t predval = p->Val();
+//                 if (p->isGlobalAgg())
+//                     p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                 else
+//                     colpass = compare(colval,
+//                                       static_cast<uint64_t>(predval),
+//                                       p->opType());
+//                 break;
+//             }
+
+//             case SDT_UINT16: {
+//                 TypedPredicate<uint16_t>* p = \
+//                         dynamic_cast<TypedPredicate<uint16_t>*>(*it);
+//                 uint16_t colval = row[p->colIdx()].AsUInt16();
+//                 uint16_t predval = p->Val();
+//                 if (p->isGlobalAgg())
+//                     p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                 else
+//                     colpass = compare(colval,
+//                                       static_cast<uint64_t>(predval),
+//                                       p->opType());
+//                 break;
+//             }
+
+//             case SDT_UINT32: {
+//                 TypedPredicate<uint32_t>* p = \
+//                         dynamic_cast<TypedPredicate<uint32_t>*>(*it);
+//                 uint32_t colval = row[p->colIdx()].AsUInt32();
+//                 uint32_t predval = p->Val();
+//                 if (p->isGlobalAgg())
+//                     p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                 else
+//                     colpass = compare(colval,
+//                                       static_cast<uint64_t>(predval),
+//                                       p->opType());
+//                 break;
+//             }
+
+//             case SDT_UINT64: {
+//                 TypedPredicate<uint64_t>* p = \
+//                         dynamic_cast<TypedPredicate<uint64_t>*>(*it);
+//                 uint64_t colval = 0;
+//                 if ((*it)->colIdx() == RID_COL_INDEX) // RID val not in the row
+//                     colval = rec.RID;
+//                 else
+//                     colval = row[p->colIdx()].AsUInt64();
+//                 uint64_t predval = p->Val();
+//                 if (p->isGlobalAgg())
+//                     p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                 else
+//                     colpass = compare(colval,predval,p->opType());
+//                 break;
+//             }
+
+//             case SDT_FLOAT: {
+//                 TypedPredicate<float>* p = \
+//                         dynamic_cast<TypedPredicate<float>*>(*it);
+//                 float colval = row[p->colIdx()].AsFloat();
+//                 float predval = p->Val();
+//                 if (p->isGlobalAgg())
+//                     p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                 else
+//                     colpass = compare(colval,
+//                                       static_cast<double>(predval),
+//                                       p->opType());
+//                 break;
+//             }
+
+//             case SDT_DOUBLE: {
+//                 TypedPredicate<double>* p = \
+//                         dynamic_cast<TypedPredicate<double>*>(*it);
+//                 double colval = row[p->colIdx()].AsDouble();
+//                 double predval = p->Val();
+//                 if (p->isGlobalAgg())
+//                     p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                 else
+//                     colpass = compare(colval,predval,p->opType());
+//                 break;
+//             }
+
+//             case SDT_CHAR: {
+//                 TypedPredicate<char>* p= \
+//                         dynamic_cast<TypedPredicate<char>*>(*it);
+//                 if (p->opType() == SOT_like) {
+//                     // use strings for regex
+//                     std::string colval = row[p->colIdx()].AsString().str();
+//                     std::string predval = std::to_string(p->Val());
+//                     colpass = compare(colval,predval,p->opType(),p->colType());
+//                 }
+//                 else {
+//                     // use int val comparision method
+//                     int8_t colval = row[p->colIdx()].AsInt8();
+//                     int8_t predval = p->Val();
+//                     if (p->isGlobalAgg())
+//                         p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                     else
+//                         colpass = compare(colval,
+//                                           static_cast<int64_t>(predval),
+//                                           p->opType());
+//                 }
+//                 break;
+//             }
+
+//             case SDT_UCHAR: {
+//                 TypedPredicate<unsigned char>* p = \
+//                         dynamic_cast<TypedPredicate<unsigned char>*>(*it);
+//                 if (p->opType() == SOT_like) {
+//                     // use strings for regex
+//                     std::string colval = row[p->colIdx()].AsString().str();
+//                     std::string predval = std::to_string(p->Val());
+//                     colpass = compare(colval,predval,p->opType(),p->colType());
+//                 }
+//                 else {
+//                     // use int val comparision method
+//                     uint8_t colval = row[p->colIdx()].AsUInt8();
+//                     uint8_t predval = p->Val();
+//                     if (p->isGlobalAgg())
+//                         p->updateAgg(computeAgg(colval,predval,p->opType()));
+//                     else
+//                         colpass = compare(colval,
+//                                           static_cast<uint64_t>(predval),
+//                                           p->opType());
+//                 }
+//                 break;
+//             }
+
+//             case SDT_STRING:
+//             case SDT_DATE: {
+//                 TypedPredicate<std::string>* p = \
+//                         dynamic_cast<TypedPredicate<std::string>*>(*it);
+//                 string colval = row[p->colIdx()].AsString().str();
+//                 colpass = compare(colval,p->Val(),p->opType(),p->colType());
+//                 break;
+//             }
+
+//             default: assert (TablesErrCodes::PredicateComparisonNotDefined==0);
+//         }
+//     }
+//     return output;
+// }
+
 
 // used by processArrow methods only
 // returns true if the record passes all of the predicates (and/or)
