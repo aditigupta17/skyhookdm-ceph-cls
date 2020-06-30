@@ -45,6 +45,8 @@ int processArrowCol(
         schema_vec& tbl_schema,
         schema_vec& query_schema,
         predicate_vec& preds,
+        std::string& groupby_cols,
+        std::string& orderby_cols,      
         const char* dataptr,
         const size_t datasz,
         std::string& errmsg,

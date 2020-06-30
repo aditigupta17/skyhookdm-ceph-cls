@@ -570,6 +570,8 @@ int processArrowCol(
         schema_vec& tbl_schema,
         schema_vec& query_schema,
         predicate_vec& preds,
+        std::string& groupby_cols,
+        std::string& orderby_cols,
         const char* dataptr,
         const size_t datasz,
         std::string& errmsg,
@@ -609,6 +611,14 @@ int processArrowCol(
             col_idx_max = it->idx;
     }
 
+    predicate_vec agg_preds;
+    predicate_vec non_agg_preds;
+
+    for (auto p : preds) {
+        if(p->isGlobalAgg()) agg_preds.push_back(p);
+        else non_agg_preds.push_back(p);
+    }
+
     // Apply predicates to all the columns and get the rows which
     // satifies the condition
     if (!preds.empty()) {
@@ -616,12 +626,332 @@ int processArrowCol(
         for (auto it = tbl_schema.begin(); it != tbl_schema.end(); ++it) {
             col_info col = *it;
 
-            applyPredicatesArrowCol(preds,
+            applyPredicatesArrowCol(non_agg_preds,
                                     input_table->column(col.idx)->chunk(0),
                                     col.idx,
                                     result_rows);
         }
         nrows = result_rows.size();
+    }
+
+    bool groupby_arg = false;
+    if(groupby_cols != "") groupby_arg = true;
+
+    /*
+        building map of key to rows for groupby
+           age | class|   
+        --------+-----
+            34 | Q   | 
+            12 | V   | 
+            34 | Q   | 
+            42 | W   | 
+        Map looks like: (vector<string> key (for eg. {age, class}) : vector<int> rnums (for eg. {1, 3, 4, 5}))
+        key                  value
+        ===============================
+        (age, class) :   [row1,..., rown]
+        (34, Q)      :   [1, 3]
+        (12, V)      :   [2]
+        (42, W)      :   [4]
+    */
+
+    std::map<std::vector<string>, std::vector<uint32_t>> groupby_map;
+    if (groupby_arg) {
+        Tables::schema_vec groupby_schema = schemaFromColNames(tbl_schema, groupby_cols);
+
+        for (auto i : result_rows) {
+            uint32_t rnum = i;
+            std::vector<string> key;
+
+            for (auto it = groupby_schema.begin(); it != groupby_schema.end() && !errcode; ++it) {
+                col_info col = *it;
+                auto builder = builder_list[std::distance(groupby_schema.begin(), it)];
+                auto processing_chunk = input_table->column(col.idx)->chunk(0);
+
+                // Append data from input tbale to the respective data type builders
+                switch(col.type) {
+                    case SDT_BOOL: {
+                        bool val = std::static_pointer_cast<arrow::BooleanArray>(processing_chunk)->Value(rnum);
+                        if(val) {
+                            key.push_back("true");
+                        } else {
+                            key.push_back("false");
+                        } 
+                        break;
+                    }  
+                    case SDT_INT8: 
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::Int8Array>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_INT16:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::Int16Array>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_INT32:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::Int32Array>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_INT64:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::Int64Array>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_UINT8:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::UInt8Array>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_UINT16:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::UInt16Array>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_UINT32:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::UInt32Array>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_UINT64:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::UInt64Array>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_FLOAT:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::FloatArray>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_DOUBLE:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::DoubleArray>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_CHAR:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::Int8Array>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_UCHAR:
+                        key.push_back(std::to_string(std::static_pointer_cast<arrow::UInt8Array>(processing_chunk)->Value(rnum)));
+                        break;
+                    case SDT_DATE:
+                    case SDT_STRING:
+                        key.push_back(std::static_pointer_cast<arrow::StringArray>(processing_chunk)->GetString(rnum));
+                        break;
+                    default: {
+                        errcode = TablesErrCodes::UnsupportedSkyDataType;
+                        errmsg.append("ERROR processArrow()");
+                        return errcode;
+                    }
+                }    
+            }
+            groupby_map[key].push_back(rnum);
+
+        } 
+    }
+
+    std::vector<uint32_t> processed;
+
+    // if groupby performed
+    if(!groupby_map.empty()) {
+        // aggs not present
+        if(agg_preds.empty()) {
+            for (auto p : groupby_map) {
+                std::vector<uint32_t> rows = p.second;
+                // act like DISTINCT, picks the first row
+                processed.push_back(rows[0]);
+            }
+        }
+        // aggs present
+        // else {
+        //     for(auto p : groupby_map) {
+        //         std::vector<uint32_t> rows = p.second;
+        //         sky_rec rec = applyAggPreds(rows, agg_preds);
+        //         processed.push_back(rec);
+        //     }
+        // }
+    }
+
+    // // no groupby
+    else {
+        // aggs not present
+        if(agg_preds.empty()) {
+            for(auto r : result_rows)
+                processed.push_back(r);
+        }
+        // // aggs present
+        // else {
+        //     sky_rec rec = applyAggPreds(non_agg_passed_rows, agg_preds);
+        //     processed.push_back(rec);
+        // }
+    }
+
+    bool orderby_arg = false;
+    if(orderby_cols != "") orderby_arg = true;
+
+    // if orderby passed, then sort
+    if (orderby_arg) {
+        // ";SUPPKEY,ASC;ORDERKEY,DESC;"
+        boost::trim(orderby_cols);  // whitespace
+        boost::trim_if(orderby_cols, boost::is_any_of(PRED_DELIM_OUTER));
+
+        vector<std::string> orderby_items;
+        boost::split(orderby_items, orderby_cols, boost::is_any_of(PRED_DELIM_OUTER),
+                     boost::token_compress_on);
+        vector<std::string> orderby_descr;
+
+        // store orderby (vector<col>, ASC/DESC)
+        vector<pair<schema_vec, std::string>> orderby_input;
+
+        for (auto it = orderby_items.begin(); it != orderby_items.end(); ++it) {
+            boost::split(orderby_descr, *it, boost::is_any_of(PRED_DELIM_INNER),
+                     boost::token_compress_on);
+            assert(orderby_descr.size() == 2);
+
+            std::string colname = orderby_descr.at(0);
+            std::string sort_type = orderby_descr.at(1);
+            boost::to_upper(colname);
+
+            schema_vec sv = schemaFromColNames(tbl_schema, colname);
+            if (sv.empty()) {
+                cerr << "Error: colname=" << colname << " not present in schema."
+                    << std::endl;
+                assert (TablesErrCodes::RequestedColNotPresent == 0);
+            }
+            orderby_input.push_back(make_pair(sv, sort_type));
+        }
+
+        // Validate input
+        for (auto arg : orderby_input) {
+            col_info col = arg.first[0];
+            std::string sort_by = arg.second;
+            // std::cout << col.name << " " << sort_by << "\n";
+            if(!(sort_by == "ASC" || sort_by == "DESC")) {
+                cerr << "Error: sorting by " << sort_by << " not supported. Use ASC/DESC."
+                    << std::endl;
+                assert (TablesErrCodes::OpNotRecognized == 0);
+            }
+        }
+
+        auto custom_sort = [orderby_input, input_table] (uint32_t &rec1, uint32_t &rec2) -> bool
+        {
+            for (auto arg : orderby_input) {
+                col_info col = arg.first[0];
+                std::string sort_by = arg.second;
+                auto processing_chunk = input_table->column(col.idx)->chunk(0);
+                switch(col.type) {  // encode data val into flexbuf
+                    case SDT_INT8:{
+                        auto val1 = std::static_pointer_cast<arrow::Int8Array>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::Int8Array>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }   
+                    case SDT_INT16: {
+                        auto val1 = std::static_pointer_cast<arrow::Int16Array>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::Int16Array>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_INT32: {
+                        auto val1 = std::static_pointer_cast<arrow::Int32Array>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::Int32Array>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_INT64: {
+                        auto val1 = std::static_pointer_cast<arrow::Int64Array>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::Int64Array>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_UINT8: {
+                        auto val1 = std::static_pointer_cast<arrow::UInt8Array>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::UInt8Array>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_UINT16: {
+                        auto val1 = std::static_pointer_cast<arrow::UInt16Array>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::UInt16Array>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_UINT32: {
+                        auto val1 = std::static_pointer_cast<arrow::UInt32Array>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::UInt32Array>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_UINT64: {
+                        auto val1 = std::static_pointer_cast<arrow::UInt64Array>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::UInt64Array>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_CHAR: {
+                        auto val1 = std::static_pointer_cast<arrow::Int8Array>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::Int8Array>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_UCHAR: {
+                        auto val1 = std::static_pointer_cast<arrow::UInt8Array>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::UInt8Array>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_FLOAT: {
+                        auto val1 = std::static_pointer_cast<arrow::FloatArray>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::FloatArray>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_DOUBLE: {
+                        auto val1 = std::static_pointer_cast<arrow::DoubleArray>(processing_chunk)->Value(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::DoubleArray>(processing_chunk)->Value(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_DATE: {
+                        auto val1 = std::static_pointer_cast<arrow::StringArray>(processing_chunk)->GetString(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::StringArray>(processing_chunk)->GetString(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    case SDT_STRING: {
+                        auto val1 = std::static_pointer_cast<arrow::StringArray>(processing_chunk)->GetString(rec1);
+                        auto val2 = std::static_pointer_cast<arrow::StringArray>(processing_chunk)->GetString(rec2);
+                        if (val1 == val2) 
+                            continue;
+                        else 
+                            return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                        break;
+                    }
+                    // TODO: Throw error for other data types
+                }
+            }
+            return true;
+        };
+        std::sort(processed.begin(), processed.end(), custom_sort);
     }
 
     // At this point we have rows which satisfied the required predicates.
@@ -794,11 +1124,12 @@ int processArrowCol(
     }
 
     // Copy values from input table rows to the output table rows
+    nrows = processed.size();
     for (uint32_t i = 0; i < nrows; i++) {
 
         uint32_t rnum = i;
         if (!preds.empty())
-            rnum = result_rows[i];
+            rnum = processed[i];
 
         // skip dead rows.
         auto delvec_chunk = input_table->column(ARROW_DELVEC_INDEX(num_cols))->chunk(0);

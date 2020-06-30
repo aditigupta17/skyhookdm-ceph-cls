@@ -678,6 +678,8 @@ void worker_exec_query_op()
                               sky_tbl_schema,
                               sky_qry_schema,
                               sky_qry_preds,
+                              qop_groupby_cols,
+                              qop_orderby_cols,
                               fbmeta.blob_data,
                               fbmeta.blob_size,
                               errmsg);
