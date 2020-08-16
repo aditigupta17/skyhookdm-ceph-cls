@@ -55,6 +55,20 @@ int processSkyFb(
             col_idx_max = it->idx;
     }
 
+    // =====================================================
+    // STEP - 1:
+    // 1. segregate preds as agg and non_agg
+    // 2. apply non_agg preds to rows and obtain passed rows
+    // =====================================================
+
+    predicate_vec agg_preds;
+    predicate_vec non_agg_preds;
+        
+    for (auto p : preds) {
+        if(p->isGlobalAgg()) agg_preds.push_back(p);
+        else non_agg_preds.push_back(p);
+    }
+
     bool project_all = std::equal(data_schema.begin(), data_schema.end(),
                                   query_schema.begin(), compareColInfo);
 
@@ -76,6 +90,7 @@ int processSkyFb(
     // 1. check the preds for passing
     // 2a. accumulate agg preds (return flexbuf built after all rows) or
     // 2b. build the return flatbuf inline below from each row's projection
+    std::vector<sky_rec> non_agg_passed_rows;
     for (uint32_t i = 0; i < nrows; i++) {
 
         // process row i or the specified row number
@@ -96,23 +111,357 @@ int processSkyFb(
 
         // apply predicates to this record
         if (!preds.empty()) {
-            bool pass = applyPredicates(preds, rec);
+            if(non_agg_preds.empty()) {
+                non_agg_passed_rows.push_back(rec);
+            }
+            bool pass = applyPredicates(non_agg_preds, rec);
             if (!pass) continue;  // skip non matching rows.
         }
-
+        non_agg_passed_rows.push_back(rec);
         // note: agg preds are accumlated in the predicate itself during
         // applyPredicates above, then later added to result fb outside
         // of this loop (i.e., they are not encoded into the result fb yet)
         // thus we can skip the below encoding of rows into the result fb
         // and just continue accumulating agg preds in this processing loop.
-        if (!encode_rows) continue;
 
         if (project_all) {
             // TODO:  just pass through row table offset to new data_vec
             // (which is also type offs), do not rebuild row table and flexbuf
         }
+    }
 
-        // build the return projection for this row.
+    // =====================================================
+    // STEP - 2:
+    // 1. Apply GROUP BY
+    // =====================================================
+    bool groupby_arg = false;
+    if(groupby_cols != "") groupby_arg = true;
+
+    // building map of key to rows for groupby
+    std::map<std::vector<string>, std::vector<sky_rec>> groupby_map;
+    if (groupby_arg) {
+        Tables::schema_vec groupby_schema = schemaFromColNames(data_schema, groupby_cols);
+        for (auto rec : non_agg_passed_rows) {
+            auto row = rec.data.AsVector();
+            std::vector<string> key;
+            for (auto it = groupby_schema.begin(); it != groupby_schema.end() && !errcode; ++it) {
+                col_info col = *it;
+                switch(col.type) {  // encode data val into flexbuf
+                    case SDT_INT8:
+                        key.push_back(std::to_string(row[col.idx].AsInt8()));
+                        break;
+                    case SDT_INT16:
+                        key.push_back(std::to_string(row[col.idx].AsInt16()));
+                        break;
+                    case SDT_INT32:
+                        key.push_back(std::to_string(row[col.idx].AsInt32()));
+                        break;
+                    case SDT_INT64:
+                        key.push_back(std::to_string(row[col.idx].AsInt64()));
+                        break;
+                    case SDT_UINT8:
+                        key.push_back(std::to_string(row[col.idx].AsUInt8()));
+                        break;
+                    case SDT_UINT16:
+                        key.push_back(std::to_string(row[col.idx].AsUInt16()));
+                        break;
+                    case SDT_UINT32:
+                        key.push_back(std::to_string(row[col.idx].AsUInt32()));
+                        break;
+                    case SDT_UINT64:
+                        key.push_back(std::to_string(row[col.idx].AsUInt64()));
+                        break;
+                    case SDT_CHAR:
+                        key.push_back(std::to_string(row[col.idx].AsInt8()));
+                        break;
+                    case SDT_UCHAR:
+                        key.push_back(std::to_string(row[col.idx].AsUInt8()));
+                        break;
+                    case SDT_BOOL: {
+                        bool val = row[col.idx].AsBool();
+                        if(val) key.push_back("true");
+                        else key.push_back("false");
+                        break;
+                    }
+                    case SDT_FLOAT:
+                        key.push_back(std::to_string(row[col.idx].AsFloat()));
+                        break;
+                    case SDT_DOUBLE:
+                        key.push_back(std::to_string(row[col.idx].AsDouble()));
+                        break;
+                    case SDT_DATE:
+                        key.push_back(row[col.idx].AsString().str());
+                        break;
+                    case SDT_STRING:
+                        key.push_back(row[col.idx].AsString().str());
+                        break;
+                    default: {
+                        errcode = TablesErrCodes::UnsupportedSkyDataType;
+                        errmsg.append("ERROR processSkyFb(): table=" +
+                                root.table_name + "; rid=" +
+                                std::to_string(rec.RID) + " col.type=" +
+                                std::to_string(col.type) +
+                                " UnsupportedSkyDataType.");
+                    }
+                }
+            }
+            groupby_map[key].push_back(rec);
+        } 
+    }
+
+    // =====================================================
+    // STEP - 3:
+    // Apply aggs
+    // 3.1. if groupby is performed
+    //      3.1.1 aggs present = take agg for each key
+    //      3.1.2 aggs not present = perform DISTINCT
+    // 3.2. if groupby is not performed
+    //      3.2.1 aggs present = take agg for non_agg_passed rows
+    //      3.2.2 aggs not present = do nothing
+    // =====================================================
+    
+    std::vector<sky_rec> processed_rows;
+
+    // if groupby performed
+    if(!groupby_map.empty()) {
+        // aggs not present
+        if(agg_preds.empty()) {
+            for (auto p : groupby_map) {
+                std::vector<sky_rec> rows = p.second;
+                // act like DISTINCT, picks the first row
+                processed_rows.push_back(rows[0]);
+            }
+        }
+        // aggs present
+        /* 
+        else {
+            for(auto p : groupby_map) {
+                std::vector<sky_rec> rows = p.second;
+                sky_rec rec = applyAggPreds(rows, agg_preds);
+                processed_rows.push_back(rec);
+            }
+        }
+        */
+    }
+
+    // no groupby
+    else {
+        // aggs not present
+        if(agg_preds.empty()) {
+            for(auto r : non_agg_passed_rows)
+                processed_rows.push_back(r);
+        }
+        // aggs present
+        /*
+        else {
+            sky_rec rec = applyAggPreds(non_agg_passed_rows, agg_preds);
+            processed_rows.push_back(rec);
+        }
+        */
+    }
+
+    // =====================================================
+    // STEP - 4: Apply orderby
+    // 4.1. Extract col info & asc/desc
+    // 4.2. Apply custom sort
+    // =====================================================
+    bool orderby_arg = false;
+    if(orderby_cols != "") orderby_arg = true;
+
+    // if orderby passed, then sort
+    if (orderby_arg) {
+        // ";SUPPKEY,ASC;ORDERKEY,DESC;"
+        boost::trim(orderby_cols);  // whitespace
+        boost::trim_if(orderby_cols, boost::is_any_of(PRED_DELIM_OUTER));
+
+        vector<std::string> orderby_items;
+        boost::split(orderby_items, orderby_cols, boost::is_any_of(PRED_DELIM_OUTER),
+                     boost::token_compress_on);
+        vector<std::string> orderby_descr;
+        
+        // store orderby (vector<col>, ASC/DESC)
+        vector<pair<schema_vec, std::string>> orderby_input;
+
+        for (auto it = orderby_items.begin(); it != orderby_items.end(); ++it) {
+            boost::split(orderby_descr, *it, boost::is_any_of(PRED_DELIM_INNER),
+                     boost::token_compress_on);
+            assert(orderby_descr.size() == 2);
+
+            std::string colname = orderby_descr.at(0);
+            std::string sort_type = orderby_descr.at(1);
+            boost::to_upper(colname);
+
+            schema_vec sv = schemaFromColNames(data_schema, colname);
+            if (sv.empty()) {
+                cerr << "Error: colname=" << colname << " not present in schema."
+                    << std::endl;
+                assert (TablesErrCodes::RequestedColNotPresent == 0);
+            }
+            orderby_input.push_back(make_pair(sv, sort_type));
+        }
+
+        // Validate input
+        for (auto arg : orderby_input) {
+            col_info col = arg.first[0];
+            std::string sort_by = arg.second;
+            if(!(sort_by == "ASC" || sort_by == "DESC")) {
+                cerr << "Error: sorting by " << sort_by << " not supported. Use ASC/DESC."
+                    << std::endl;
+                assert (TablesErrCodes::OpNotRecognized == 0);
+            }
+        }
+
+        auto custom_sort = [orderby_input] (sky_rec &rec1, sky_rec &rec2) -> bool
+        {
+            for (auto arg : orderby_input) {
+                col_info col = arg.first[0];
+                std::string sort_by = arg.second;
+                auto row1 = rec1.data.AsVector();
+                auto row2 = rec2.data.AsVector();
+                switch(col.type) {  // encode data val into flexbuf
+                        case SDT_INT8:{
+                            auto val1 = row1[col.idx].AsInt8();
+                            auto val2 = row2[col.idx].AsInt8();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }   
+                        case SDT_INT16: {
+                            auto val1 = row1[col.idx].AsInt16();
+                            auto val2 = row2[col.idx].AsInt16();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_INT32: {
+                            auto val1 = row1[col.idx].AsInt32();
+                            auto val2 = row2[col.idx].AsInt32();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_INT64: {
+                            auto val1 = row1[col.idx].AsInt64();
+                            auto val2 = row2[col.idx].AsInt64();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_UINT8: {
+                            auto val1 = row1[col.idx].AsUInt8();
+                            auto val2 = row2[col.idx].AsUInt8();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_UINT16: {
+                            auto val1 = row1[col.idx].AsUInt16();
+                            auto val2 = row2[col.idx].AsUInt16();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_UINT32: {
+                            auto val1 = row1[col.idx].AsUInt32();
+                            auto val2 = row2[col.idx].AsUInt32();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_UINT64: {
+                            auto val1 = row1[col.idx].AsUInt64();
+                            auto val2 = row2[col.idx].AsUInt64();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_CHAR: {
+                            auto val1 = row1[col.idx].AsInt8();
+                            auto val2 = row2[col.idx].AsInt8();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_UCHAR: {
+                            auto val1 = row1[col.idx].AsUInt8();
+                            auto val2 = row2[col.idx].AsUInt8();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_FLOAT: {
+                            auto val1 = row1[col.idx].AsFloat();
+                            auto val2 = row2[col.idx].AsFloat();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_DOUBLE: {
+                            auto val1 = row1[col.idx].AsDouble();
+                            auto val2 = row2[col.idx].AsDouble();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_DATE: {
+                            auto val1 = row1[col.idx].AsString().str();
+                            auto val2 = row2[col.idx].AsString().str();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        case SDT_STRING: {
+                            auto val1 = row1[col.idx].AsString().str();
+                            auto val2 = row2[col.idx].AsString().str();
+                            if (val1 == val2) 
+                                continue;
+                            else 
+                                return (sort_by == "ASC") ? (val1 < val2) : (val1 > val2);
+                            break;
+                        }
+                        // TODO: Throw error for other data types
+                }
+            }
+            return true;
+        };
+        std::sort(processed_rows.begin(), processed_rows.end(), custom_sort);
+    }
+
+    // else, do nothing
+
+    // =====================================================
+    // STEP - 5:
+    // Apply project
+    // Return projection for all processed rows
+    // =====================================================
+
+    for(auto rec : processed_rows) {
         auto row = rec.data.AsVector();
         flexbuffers::Builder *flexbldr = new flexbuffers::Builder();
         flatbuffers::Offset<flatbuffers::Vector<unsigned char>> datavec;
@@ -121,7 +470,7 @@ int processSkyFb(
 
             // iter over the query schema, locating it within the data schema
             for (auto it=query_schema.begin();
-                      it!=query_schema.end() && !errcode; ++it) {
+                    it!=query_schema.end() && !errcode; ++it) {
                 col_info col = *it;
                 if (col.idx < AGG_COL_LAST or col.idx > col_idx_max) {
                     errcode = TablesErrCodes::RequestedColIndexOOB;
@@ -203,82 +552,6 @@ int processSkyFb(
         auto nullbits = flatbldr.CreateVector(rec.nullbits);
         flatbuffers::Offset<Tables::Record> row_off = \
                 Tables::CreateRecord(flatbldr, rec.RID, nullbits, row_data);
-
-        // Continue building the ROOT flatbuf's dead vector and rowOffsets vec
-        dead_rows.push_back(0);
-        offs.push_back(row_off);
-    }
-
-    // here we build the return flatbuf result with agg values that were
-    // accumulated above in applyPredicates (agg predicates do not return
-    // true false but update their internal values each time processed
-    if (encode_aggs) { //  encode accumulated agg pred val into return flexbuf
-        PredicateBase* pb;
-        flexbuffers::Builder *flexbldr = new flexbuffers::Builder();
-        flexbldr->Vector([&]() {
-            for (auto itp = preds.begin(); itp != preds.end(); ++itp) {
-
-                // assumes preds appear in same order as return schema
-                if (!(*itp)->isGlobalAgg()) continue;
-                pb = *itp;
-                switch(pb->colType()) {  // encode agg data val into flexbuf
-                    case SDT_INT64: {
-                        TypedPredicate<int64_t>* p = \
-                                dynamic_cast<TypedPredicate<int64_t>*>(pb);
-                        int64_t agg_val = p->Val();
-                        flexbldr->Add(agg_val);
-                        p->updateAgg(0);  // reset accumulated add val
-                        break;
-                    }
-                    case SDT_UINT32: {
-                        TypedPredicate<uint32_t>* p = \
-                                dynamic_cast<TypedPredicate<uint32_t>*>(pb);
-                        uint32_t agg_val = p->Val();
-                        flexbldr->Add(agg_val);
-                        p->updateAgg(0);  // reset accumulated add val
-                        break;
-                    }
-                    case SDT_UINT64: {
-                        TypedPredicate<uint64_t>* p = \
-                                dynamic_cast<TypedPredicate<uint64_t>*>(pb);
-                        uint64_t agg_val = p->Val();
-                        flexbldr->Add(agg_val);
-                        p->updateAgg(0);  // reset accumulated add val
-                        break;
-                    }
-                    case SDT_FLOAT: {
-                        TypedPredicate<float>* p = \
-                                dynamic_cast<TypedPredicate<float>*>(pb);
-                        float agg_val = p->Val();
-                        flexbldr->Add(agg_val);
-                        p->updateAgg(0);  // reset accumulated add val
-                        break;
-                    }
-                    case SDT_DOUBLE: {
-                        TypedPredicate<double>* p = \
-                                dynamic_cast<TypedPredicate<double>*>(pb);
-                        double agg_val = p->Val();
-                        flexbldr->Add(agg_val);
-                        p->updateAgg(0);  // reset accumulated add val
-                        break;
-                    }
-                    default:  assert(UnsupportedAggDataType==0);
-                }
-            }
-        });
-        // finalize the row's projected data within our flexbuf
-        flexbldr->Finish();
-
-        // build the return ROW flatbuf that contains the flexbuf data
-        auto row_data = flatbldr.CreateVector(flexbldr->GetBuffer());
-        delete flexbldr;
-
-        // assume no nullbits in the agg results. ?
-        nullbits_vector nb(2,0);
-        auto nullbits = flatbldr.CreateVector(nb);
-        int RID = -1;  // agg recs only, since these are derived data
-        flatbuffers::Offset<Tables::Record> row_off = \
-            Tables::CreateRecord(flatbldr, RID, nullbits, row_data);
 
         // Continue building the ROOT flatbuf's dead vector and rowOffsets vec
         dead_rows.push_back(0);
@@ -1177,7 +1450,6 @@ int processSkyFbWASM(
         // of this loop (i.e., they are not encoded into the result fb yet)
         // thus we can skip the below encoding of rows into the result fb
         // and just continue accumulating agg preds in this processing loop.
-        if (!encode_rows) continue;
 
         if (project_all) {
             // TODO:  just pass through row table offset to new data_vec
