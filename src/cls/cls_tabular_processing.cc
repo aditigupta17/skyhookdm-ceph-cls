@@ -9,6 +9,8 @@
 */
 
 #include "cls_tabular_processing.h"
+#include "cls_tabular_utils.h"
+#include <boost/algorithm/string/split.hpp>
 
 
 namespace Tables {
